@@ -16,7 +16,7 @@ const CONFIG = {
   ACCESS_TOKEN: process.env.ACCESS_TOKEN,
   FILES: {
     converted: './output.json',
-    uploaded: './uploaded-log.json'
+    uploaded: './uploader-event.json'
   }
 };
 

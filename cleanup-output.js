@@ -51,17 +51,17 @@ function cleanupOutput() {
     return;
   }
   
-  if (!fs.existsSync('./uploaded-log.json')) {
-    console.log('⚠️  uploaded-log.json not found. No events to filter.\n');
+  if (!fs.existsSync('./uploader-event.json')) {
+    console.log('⚠️  uploader-event.json not found. No events to filter.\n');
     return;
   }
   
   const outputEvents = JSON.parse(fs.readFileSync('./output.json', 'utf-8'));
-  const uploadedLog = JSON.parse(fs.readFileSync('./uploaded-log.json', 'utf-8'));
+  const uploadedLog = JSON.parse(fs.readFileSync('./uploader-event.json', 'utf-8'));
   
   console.log(`📊 Current status:`);
   console.log(`   Events in output.json: ${outputEvents.length}`);
-  console.log(`   Events in uploaded-log.json: ${uploadedLog.length}\n`);
+  console.log(`   Events in uploader-event.json: ${uploadedLog.length}\n`);
   
   // Filter out already-uploaded events
   const filteredEvents = outputEvents.filter(event => {

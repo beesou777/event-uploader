@@ -1,7 +1,13 @@
 import fs from 'fs';
 import nlp from 'compromise';
 import axios from 'axios';
-import { parseISO, format, isValid, parse, addDays, setYear } from 'date-fns';
+import { parseISO, format, isValid, parse, addDays, setYear, differenceInDays } from 'date-fns';
+import OpenAI from 'openai';
+import Anthropic from '@anthropic-ai/sdk';
+import { HfInference } from '@huggingface/inference';
+import dotenv from 'dotenv';
+
+dotenv.config();
 
 // ==================== MAIN TECH CATEGORIES FOR NORWAY ====================
 const MAIN_CATEGORIES = [
@@ -71,7 +77,186 @@ const MAIN_CATEGORIES = [
   }
 ];
 
+// ==================== AI MODEL CONFIGURATION ====================
+const AI_CONFIG = {
+  provider: process.env.AI_PROVIDER || 'huggingface', // 'huggingface' (FREE), 'openai', or 'anthropic'
+  huggingface: {
+    apiKey: process.env.HUGGINGFACE_API_KEY || '', // Optional - free tier works without key
+    model: process.env.HUGGINGFACE_MODEL || 'meta-llama/Llama-3.2-3B-Instruct' // Free model
+  },
+  openai: {
+    apiKey: process.env.OPENAI_API_KEY,
+    model: process.env.OPENAI_MODEL || 'gpt-4o-mini'
+  },
+  anthropic: {
+    apiKey: process.env.ANTHROPIC_API_KEY,
+    model: process.env.ANTHROPIC_MODEL || 'claude-3-haiku-20240307'
+  },
+  // Hugging Face is enabled by default (free tier)
+  enabled: !!(process.env.HUGGINGFACE_API_KEY || process.env.OPENAI_API_KEY || process.env.ANTHROPIC_API_KEY || process.env.AI_PROVIDER === 'huggingface')
+};
+
+// Initialize AI clients
+let openaiClient = null;
+let anthropicClient = null;
+let huggingfaceClient = null;
+
+if (AI_CONFIG.enabled) {
+  if (AI_CONFIG.provider === 'huggingface') {
+    // Hugging Face works with or without API key (free tier)
+    huggingfaceClient = new HfInference(AI_CONFIG.huggingface.apiKey || undefined);
+  } else if (AI_CONFIG.provider === 'openai' && AI_CONFIG.openai.apiKey) {
+    openaiClient = new OpenAI({ apiKey: AI_CONFIG.openai.apiKey });
+  } else if (AI_CONFIG.provider === 'anthropic' && AI_CONFIG.anthropic.apiKey) {
+    anthropicClient = new Anthropic({ apiKey: AI_CONFIG.anthropic.apiKey });
+  }
+}
+
 // ==================== AI-POWERED FEATURE EXTRACTION ====================
+async function extractFeaturesWithAI(text, eventName) {
+  if (!AI_CONFIG.enabled || !text || text.length < 50) {
+    return extractFeaturesWithNLP(text);
+  }
+
+  try {
+    const prompt = `Extract 3-5 key features/benefits from this tech event description. 
+Each feature should be a unique, specific benefit (10-100 characters).
+Do NOT repeat the event title. Make features distinct from each other.
+
+Event Title: ${eventName}
+Description: ${text.substring(0, 2000)}
+
+Return ONLY a JSON array of feature strings, no other text:
+["Feature 1", "Feature 2", "Feature 3"]`;
+
+    let features = [];
+
+    if (huggingfaceClient) {
+      // Hugging Face (FREE) - using chat completion for instruction models
+      try {
+        // Format as chat message for instruction-tuned models
+        const chatPrompt = `<|user|>
+${prompt}
+<|assistant|>
+`;
+        
+        const response = await huggingfaceClient.textGeneration({
+          model: AI_CONFIG.huggingface.model,
+          inputs: chatPrompt,
+          parameters: {
+            max_new_tokens: 300,
+            temperature: 0.7,
+            return_full_text: false,
+            stop_sequences: ['<|end|>', '</s>', '\n\n\n']
+          }
+        });
+        
+        let content = response.generated_text?.trim() || '';
+        
+        // Clean up the response
+        content = content
+          .replace(/<\|assistant\|\>/g, '')
+          .replace(/<\|end\|\>/g, '')
+          .trim();
+        
+        // Try to extract JSON array from response
+        const jsonMatch = content.match(/\[[\s\S]*?\]/);
+        if (jsonMatch) {
+          try {
+            features = JSON.parse(jsonMatch[0]);
+          } catch {
+            // Try to fix common JSON issues
+            const fixed = jsonMatch[0]
+              .replace(/'/g, '"')
+              .replace(/(\w+):/g, '"$1":');
+            try {
+              features = JSON.parse(fixed);
+            } catch {
+              features = extractFeaturesFromText(content);
+            }
+          }
+        } else {
+          // Try parsing the whole response
+          try {
+            features = JSON.parse(content);
+          } catch {
+            // Extract features from text format
+            features = extractFeaturesFromText(content);
+          }
+        }
+      } catch (hfError) {
+        console.warn('Hugging Face API error, using NLP fallback:', hfError.message);
+        features = extractFeaturesWithNLP(text);
+      }
+    } else if (openaiClient) {
+      const response = await openaiClient.chat.completions.create({
+        model: AI_CONFIG.openai.model,
+        messages: [{ role: 'user', content: prompt }],
+        temperature: 0.7,
+        max_tokens: 300
+      });
+      const content = response.choices[0]?.message?.content?.trim() || '';
+      try {
+        features = JSON.parse(content);
+      } catch {
+        // Fallback to NLP if JSON parse fails
+        features = extractFeaturesWithNLP(text);
+      }
+    } else if (anthropicClient) {
+      const response = await anthropicClient.messages.create({
+        model: AI_CONFIG.anthropic.model,
+        max_tokens: 300,
+        messages: [{ role: 'user', content: prompt }]
+      });
+      const content = response.content[0]?.text?.trim() || '';
+      try {
+        features = JSON.parse(content);
+      } catch {
+        features = extractFeaturesWithNLP(text);
+      }
+    }
+
+    // Validate and clean features
+    return Array.isArray(features)
+      ? features
+          .filter(f => f && typeof f === 'string' && f.trim() !== '' && f !== eventName)
+          .map(f => f.trim())
+          .filter(f => f.length > 10 && f.length < 200)
+          .slice(0, 5)
+      : extractFeaturesWithNLP(text);
+  } catch (error) {
+    console.warn('AI feature extraction failed, using NLP fallback:', error.message);
+    return extractFeaturesWithNLP(text);
+  }
+}
+
+// Helper to extract features from text format
+function extractFeaturesFromText(text) {
+  const features = [];
+  
+  // Try to find list items
+  const lines = text.split('\n')
+    .map(line => line.trim())
+    .filter(line => line.length > 0);
+  
+  for (const line of lines) {
+    // Match quoted strings
+    const quoted = line.match(/"([^"]+)"/);
+    if (quoted && quoted[1].length > 10 && quoted[1].length < 200) {
+      features.push(quoted[1]);
+    }
+    // Match list items with dashes or numbers
+    else if (line.match(/^[-•\d+\.]\s*(.+)/)) {
+      const match = line.match(/^[-•\d+\.]\s*(.+)/);
+      if (match && match[1].length > 10 && match[1].length < 200) {
+        features.push(match[1].trim());
+      }
+    }
+  }
+  
+  return features.slice(0, 5);
+}
+
 function extractFeaturesWithNLP(text) {
   if (!text || text.length < 50) {
     return [];
@@ -208,6 +393,25 @@ function matchCategories(eventText) {
     .sort((a, b) => b.score - a.score)
     .map(cat => cat.id)
     .slice(0, 3); // Max 3 categories per event
+}
+
+// ==================== FILTER EVENTS BY DATE (MIN 2-3 DAYS FROM TODAY) ====================
+export function filterEventsByDate(events, minDays = 2) {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  
+  return events.filter(event => {
+    const startDate = parseDate(
+      event.startDate || 
+      event.start_date || 
+      event.dateTime || 
+      event.dateText ||
+      event.date
+    );
+    
+    const daysFromToday = differenceInDays(startDate, today);
+    return daysFromToday >= minDays;
+  });
 }
 
 // ==================== PARSE DATE INTELLIGENTLY ====================
@@ -351,11 +555,70 @@ function extractTicketInfo(event) {
   };
 }
 
+// ==================== HELPER: EXTRACT TITLE FROM URL ====================
+function extractTitleFromUrl(url) {
+  if (!url) return null;
+  try {
+    // Eventbrite URLs: /e/event-name-slug-tickets-123456
+    const eventbriteMatch = url.match(/\/e\/([^\/\?]+)/);
+    if (eventbriteMatch) {
+      let slug = eventbriteMatch[1];
+      slug = slug.replace(/-tickets-\d+.*$/, '');
+      const title = slug
+        .split('-')
+        .map(word => word.charAt(0).toUpperCase() + word.slice(1))
+        .join(' ');
+      return title;
+    }
+    
+    // Meetup URLs: /event-name-slug/
+    const meetupMatch = url.match(/\/events\/([^\/\?]+)/);
+    if (meetupMatch) {
+      const slug = meetupMatch[1];
+      const title = slug
+        .split('-')
+        .map(word => word.charAt(0).toUpperCase() + word.slice(1))
+        .join(' ');
+      return title;
+    }
+  } catch (err) {
+    // Silent fail
+  }
+  return null;
+}
+
+// ==================== HELPER: IS GENERIC STATUS ====================
+function isGenericStatusMessage(text) {
+  if (!text) return true;
+  const generic = [
+    'sales end soon', 'just added', 'going fast', 'almost full',
+    'sold out', 'sales ended', 'privacy policy', 'terms & conditions',
+    'code of conduct', 'register now', 'book now', 'buy tickets'
+  ];
+  const normalized = text.toLowerCase().trim();
+  return generic.some(msg => normalized === msg || normalized.startsWith(msg + ' '));
+}
+
 // ==================== MAIN CONVERTER ====================
-export function convertToEventSchema(scrapedEvent) {
+export async function convertToEventSchema(scrapedEvent) {
+  // Fix title if it's a generic status message
+  let eventName = scrapedEvent.name || '';
+  if (isGenericStatusMessage(eventName)) {
+    // Try to extract from URL
+    const urlTitle = extractTitleFromUrl(scrapedEvent.url || scrapedEvent.externalRedirectUrl || '');
+    if (urlTitle && !isGenericStatusMessage(urlTitle) && urlTitle.length > 5) {
+      eventName = urlTitle;
+    } else if (scrapedEvent.dateText && !isGenericStatusMessage(scrapedEvent.dateText) && scrapedEvent.dateText.length > 10) {
+      // Use dateText if it looks like a title
+      if (!/^(Mon|Tue|Wed|Thu|Fri|Sat|Sun|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)/i.test(scrapedEvent.dateText)) {
+        eventName = scrapedEvent.dateText;
+      }
+    }
+  }
+  
   // Extract all text for analysis
   const fullText = [
-    scrapedEvent.name,
+    eventName,
     scrapedEvent.description,
     scrapedEvent.summary,
     scrapedEvent.organizer,
@@ -370,10 +633,9 @@ export function convertToEventSchema(scrapedEvent) {
     categoryIds.push(1);
   }
   
-  // Extract features using NLP
-  const features = extractFeaturesWithNLP(
-    scrapedEvent.description || scrapedEvent.summary || scrapedEvent.name
-  );
+  // Extract features using AI (with NLP fallback)
+  const descriptionText = scrapedEvent.description || scrapedEvent.summary || eventName || '';
+  const features = await extractFeaturesWithAI(descriptionText, eventName);
   
   // Extract social media links
   const socialMedias = extractSocialMedia(fullText, scrapedEvent.url);
@@ -411,14 +673,21 @@ export function convertToEventSchema(scrapedEvent) {
     .replace(/^-|-$/g, '');
   
   // Build final event object
-  // Ensure description is never empty (API requirement)
-  const description = scrapedEvent.description || scrapedEvent.summary || scrapedEvent.name || '';
-  const finalDescription = description.trim() === '' || description === 'No description' 
-    ? `Join us for ${scrapedEvent.name || 'this event'}. Visit the event page for more details.`
-    : description;
+  // Ensure description is never empty and different from title (API requirement)
+  let description = scrapedEvent.description || scrapedEvent.summary || '';
   
-  return {
-    name: scrapedEvent.name || 'Untitled Event',
+  // Fix duplicate title/description issue
+  if (description.trim().toLowerCase() === eventName.toLowerCase() || 
+      description.trim() === '' || 
+      description === 'No description') {
+    // Generate a unique description that's different from the title
+    description = `Join us for ${eventName || 'this event'}. This is a tech event in Norway. Visit the event page for more details and registration information.`;
+  }
+  
+  const finalDescription = description;
+  
+  const finalEvent = {
+    name: eventName || 'Untitled Event',
     slug: slug || `event-${Date.now()}`,
     
     description: finalDescription,
@@ -452,39 +721,72 @@ export function convertToEventSchema(scrapedEvent) {
     // Ensure at least one feature (API requirement)
     features: features.filter(f => f && typeof f === 'string' && f.trim() !== '').length > 0 
       ? features.filter(f => f && typeof f === 'string' && f.trim() !== '')
-      : [`Join us for this ${scrapedEvent.name || 'event'}. Check the event page for more details.`],
+      : [`Join us for this ${eventName || 'event'}. Check the event page for more details.`],
     
     tickets: [ticket],
     refundPolicy: scrapedEvent.refundPolicy || 'Please visit the event page for refund policy information',
-    externalRedirectUrl: scrapedEvent.url || scrapedEvent.externalRedirectUrl || '',
+    // CRITICAL: Always ensure externalRedirectUrl is set (required field)
+    externalRedirectUrl: scrapedEvent.url || scrapedEvent.externalRedirectUrl || scrapedEvent.link || '',
   };
+  
+  // Validate that externalRedirectUrl is present
+  if (!finalEvent.externalRedirectUrl || finalEvent.externalRedirectUrl.trim() === '') {
+    console.warn(`⚠️  Event "${finalEvent.name}" is missing externalRedirectUrl - this may cause upload issues`);
+  }
+  
+  return finalEvent;
 }
 
 // ==================== BATCH CONVERT ====================
-export function convertAllEvents(scrapedEvents) {
-  console.log(`\n🔄 Converting ${scrapedEvents.length} events to schema...\n`);
+export async function convertAllEvents(scrapedEvents) {
+  console.log(`\n🔄 Converting ${scrapedEvents.length} events to schema...`);
+  if (AI_CONFIG.enabled) {
+    const providerName = AI_CONFIG.provider === 'huggingface' ? 'Hugging Face (FREE)' : AI_CONFIG.provider;
+    console.log(`🤖 Using AI model: ${providerName} (${AI_CONFIG[AI_CONFIG.provider].model})`);
+    if (AI_CONFIG.provider === 'huggingface') {
+      console.log(`   💰 FREE - No API costs!`);
+    }
+  } else {
+    console.log(`📝 Using NLP fallback (set AI_PROVIDER=huggingface for FREE AI)`);
+  }
+  console.log();
   
   const converted = [];
   const errors = [];
   
-  scrapedEvents.forEach((event, index) => {
+  // Filter events by date (at least 2-3 days from today)
+  const minDaysFromToday = parseInt(process.env.MIN_DAYS_FROM_TODAY) || 2;
+  const dateFilteredEvents = filterEventsByDate(scrapedEvents, minDaysFromToday);
+  
+  if (dateFilteredEvents.length < scrapedEvents.length) {
+    console.log(`📅 Filtered out ${scrapedEvents.length - dateFilteredEvents.length} events (must be at least ${minDaysFromToday} days from today)`);
+  }
+  
+  for (let index = 0; index < dateFilteredEvents.length; index++) {
+    const event = dateFilteredEvents[index];
     try {
-      const converted_event = convertToEventSchema(event);
+      const converted_event = await convertToEventSchema(event);
       converted.push(converted_event);
       
-      console.log(`✅ [${index + 1}/${scrapedEvents.length}] ${event.name}`);
+      console.log(`✅ [${index + 1}/${dateFilteredEvents.length}] ${event.name}`);
       console.log(`   Categories: ${converted_event.categoryIds.map(id => 
         MAIN_CATEGORIES.find(c => c.id === id)?.name
       ).join(', ')}`);
       console.log(`   Features: ${converted_event.features.length} extracted`);
       console.log(`   Social: ${Object.values(converted_event.socialMedias).filter(Boolean).length} links found`);
+      console.log(`   Redirect URL: ${converted_event.externalRedirectUrl ? '✅' : '❌ MISSING'}`);
+      
+      // Small delay to avoid rate limiting with AI APIs
+      if (AI_CONFIG.enabled && index < dateFilteredEvents.length - 1) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
     } catch (error) {
-      console.error(`❌ [${index + 1}/${scrapedEvents.length}] Error: ${error.message}`);
+      console.error(`❌ [${index + 1}/${dateFilteredEvents.length}] Error: ${error.message}`);
       errors.push({ event: event.name, error: error.message });
     }
-  });
+  }
   
-  console.log(`\n✅ Successfully converted: ${converted.length}/${scrapedEvents.length}`);
+  console.log(`\n✅ Successfully converted: ${converted.length}/${dateFilteredEvents.length}`);
   if (errors.length > 0) {
     console.log(`❌ Errors: ${errors.length}`);
   }
@@ -497,15 +799,17 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const inputFile = process.argv[2] || './scraped-unique.json';
   const outputFile = './output.json';
   
-  try {
-    const scrapedEvents = JSON.parse(fs.readFileSync(inputFile, 'utf-8'));
-    const converted = convertAllEvents(scrapedEvents);
-    
-    fs.writeFileSync(outputFile, JSON.stringify(converted, null, 2));
-    console.log(`\n💾 Saved ${converted.length} events to ${outputFile}`);
-  } catch (error) {
-    console.error('Error:', error.message);
-  }
+  (async () => {
+    try {
+      const scrapedEvents = JSON.parse(fs.readFileSync(inputFile, 'utf-8'));
+      const converted = await convertAllEvents(scrapedEvents);
+      
+      fs.writeFileSync(outputFile, JSON.stringify(converted, null, 2));
+      console.log(`\n💾 Saved ${converted.length} events to ${outputFile}`);
+    } catch (error) {
+      console.error('Error:', error.message);
+    }
+  })();
 }
 
 export { MAIN_CATEGORIES };

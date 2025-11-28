@@ -2,6 +2,7 @@ import axios from 'axios';
 import * as cheerio from 'cheerio';
 import fs from 'fs';
 import { format, parseISO, addDays } from 'date-fns';
+import puppeteer from 'puppeteer';
 
 // ==================== SCRAPER CONFIGURATION ====================
 const NORWAY_LOCATIONS = ['Oslo', 'Bergen', 'Trondheim', 'Stavanger', 'Norway', 'Norge'];
@@ -17,39 +18,82 @@ const TECH_KEYWORDS = [
   'fintech', 'healthtech', 'edtech', 'saas', 'api', 'microservices'
 ];
 
+// ==================== HELPER: EXTRACT TITLE FROM URL ====================
+function extractTitleFromEventbriteUrl(url) {
+  try {
+    // Eventbrite URLs format: /e/event-name-slug-tickets-123456
+    const match = url.match(/\/e\/([^\/\?]+)/);
+    if (match) {
+      let slug = match[1];
+      // Remove "-tickets-123456" suffix
+      slug = slug.replace(/-tickets-\d+.*$/, '');
+      // Convert slug to title (capitalize words)
+      const title = slug
+        .split('-')
+        .map(word => word.charAt(0).toUpperCase() + word.slice(1))
+        .join(' ');
+      return title;
+    }
+  } catch (err) {
+    // Silent fail
+  }
+  return null;
+}
+
+// ==================== HELPER: FILTER GENERIC STATUS MESSAGES ====================
+function isGenericStatusMessage(text) {
+  if (!text) return true;
+  const genericMessages = [
+    'sales end soon',
+    'just added',
+    'going fast',
+    'almost full',
+    'sold out',
+    'sales ended',
+    'privacy policy',
+    'terms & conditions',
+    'code of conduct',
+    'register now',
+    'book now',
+    'buy tickets'
+  ];
+  const normalized = text.toLowerCase().trim();
+  return genericMessages.some(msg => normalized === msg || normalized.startsWith(msg + ' '));
+}
+
+// ==================== HELPER: EXTRACT REAL TITLE ====================
+function extractRealTitle(name, dateText, url) {
+  // If name is a generic status message, try alternatives
+  if (isGenericStatusMessage(name)) {
+    // Try dateText - often contains the real title
+    if (dateText && !isGenericStatusMessage(dateText) && dateText.length > 10) {
+      // Check if dateText looks like a title (not a date)
+      if (!/^(Mon|Tue|Wed|Thu|Fri|Sat|Sun|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)/i.test(dateText) &&
+          !/^\d{1,2}[\/\-]\d{1,2}/.test(dateText)) {
+        return dateText;
+      }
+    }
+    
+    // Try extracting from URL
+    const urlTitle = extractTitleFromEventbriteUrl(url);
+    if (urlTitle && !isGenericStatusMessage(urlTitle) && urlTitle.length > 5) {
+      return urlTitle;
+    }
+  }
+  
+  // Return original name if it's not generic
+  return name;
+}
+
 // ==================== EVENTBRITE SCRAPER (ENHANCED) ====================
 async function scrapeEventbrite() {
-  console.log('🔍 Scraping Eventbrite Norway (Enhanced - Multiple Categories)...');
+  console.log('🔍 Scraping Eventbrite Norway Tech Events...');
   const events = [];
   
-  // Multiple categories to search
-  const categories = [
-    'technology',
-    'business',
-    'science-tech',
-    'education',
-    'conference',
-    'workshop',
-    'networking',
-    'startup',
-    'innovation'
-  ];
-  
-  const locations = ['Oslo', 'Bergen', 'Trondheim', 'Stavanger', 'Norway'];
-  
   try {
-    for (const location of locations) {
-      for (const category of categories) {
-        try {
-          // Try multiple URL patterns
-          const urls = [
-            `https://www.eventbrite.com/d/norway--${location.toLowerCase()}/${category}/`,
-            `https://www.eventbrite.com/d/${location.toLowerCase()}-norway/${category}/`,
-            `https://www.eventbrite.com/d/norway/${category}/?q=${category}`
-          ];
+    // Use the direct tech events URL for Norway
+    const url = 'https://www.eventbrite.com/d/norway/tech-events/';
           
-          for (const url of urls) {
-            try {
               const response = await axios.get(url, {
                 headers: {
                   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -69,10 +113,9 @@ async function scrapeEventbrite() {
                 '.search-event-card-wrapper',
                 'article[class*="event"]',
                 '[class*="EventCard"]',
-                '.eds-event-card'
+      '.eds-event-card',
+      '[data-automation="event-card"]'
               ];
-              
-              let foundInThisPage = 0;
               
               for (const selector of selectors) {
                 $(selector).each((i, el) => {
@@ -80,7 +123,7 @@ async function scrapeEventbrite() {
                     const $el = $(el);
                     
                     // Try multiple ways to extract name
-                    const name = $el.find('.Typography_root__487rx').first().text().trim() ||
+          let name = $el.find('.Typography_root__487rx').first().text().trim() ||
                                 $el.find('h2, h3, h4').first().text().trim() ||
                                 $el.find('[class*="title"], [class*="name"]').first().text().trim() ||
                                 $el.attr('aria-label') || '';
@@ -90,7 +133,7 @@ async function scrapeEventbrite() {
                                 $el.attr('href') ||
                                 $el.find('[href*="/e/"]').attr('href') || '';
                     
-                    // Try multiple ways to extract date
+          // Try multiple ways to extract date (often contains real title!)
                     const dateText = $el.find('.Typography_root__487rx').eq(1).text().trim() ||
                                    $el.find('time').attr('datetime') ||
                                    $el.find('time').text().trim() ||
@@ -107,45 +150,37 @@ async function scrapeEventbrite() {
                     
                     if (name && link && name.length > 5) {
                       const fullUrl = link.startsWith('http') ? link : `https://www.eventbrite.com${link}`;
+            
+            // Extract real title (filter out generic status messages)
+            const realTitle = extractRealTitle(name, dateText, fullUrl);
+            
+            // Skip if we couldn't find a real title
+            if (!realTitle || isGenericStatusMessage(realTitle) || realTitle.length < 5) {
+              return; // Skip this event
+            }
                       
                       // Avoid duplicates
                       if (!events.some(e => e.url === fullUrl)) {
                         events.push({
                           source: 'eventbrite',
-                          name: name,
+                name: realTitle, // Use the real title, not generic status
                           url: fullUrl,
                           dateText: dateText,
                           priceText: priceText,
                           image: image,
-                          location: location,
+                location: 'Norway',
                           country: 'Norway',
-                          category: category
+                category: 'technology'
                         });
-                        foundInThisPage++;
                       }
                     }
                   } catch (err) {
                     // Silent fail for individual event parsing
                   }
                 });
-                
-                if (foundInThisPage > 0) break; // Found events with this selector, move on
-              }
-              
-              // Small delay to avoid rate limiting
-              await new Promise(resolve => setTimeout(resolve, 500));
-              
-            } catch (err) {
-              // Silent fail for individual URL attempts
-            }
-          }
-        } catch (err) {
-          // Silent fail for category
-        }
-      }
-      
-      console.log(`  Found ${events.length} total events from ${location}`);
     }
+    
+    console.log(`  Found ${events.length} events from Eventbrite`);
   } catch (error) {
     console.error('Eventbrite scraping error:', error.message);
   }
@@ -153,306 +188,251 @@ async function scrapeEventbrite() {
   return events;
 }
 
-// ==================== MEETUP.COM SCRAPER (ENHANCED) ====================
+// ==================== MEETUP.COM SCRAPER (Using Puppeteer for JS-rendered content) ====================
 async function scrapeMeetup() {
-  console.log('🔍 Scraping Meetup.com Norway (Enhanced - Multiple Keywords & Cities)...');
+  console.log('🔍 Scraping Meetup.com Norway Tech Events...');
   const events = [];
+  let browser = null;
   
   try {
-    const keywords = [
-      'tech', 'technology', 'ai', 'artificial intelligence', 'machine learning',
-      'startup', 'developer', 'programming', 'coding', 'software',
-      'innovation', 'business', 'entrepreneur', 'networking',
-      'data science', 'cybersecurity', 'cloud', 'blockchain',
-      'web development', 'mobile development', 'devops'
+    // Meetup uses JavaScript rendering, so we need Puppeteer
+    browser = await puppeteer.launch({ 
+      headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox']
+    });
+    
+    const urls = [
+      'https://www.meetup.com/find/?source=EVENTS&location=no--oslo&categoryId=546&eventType=all',
+      'https://www.meetup.com/find/?source=EVENTS&location=no--bergen&categoryId=546&eventType=all',
+      'https://www.meetup.com/find/?source=EVENTS&location=no--trondheim&categoryId=546&eventType=all',
+      'https://www.meetup.com/find/?source=EVENTS&location=no--stavanger&categoryId=546&eventType=all'
     ];
     
-    const cities = ['oslo', 'bergen', 'trondheim', 'stavanger', 'tromso'];
-    
-    for (const city of cities) {
-      for (const keyword of keywords) {
-        try {
-          const url = `https://www.meetup.com/find/?keywords=${encodeURIComponent(keyword)}&location=no--${city}&source=EVENTS`;
-          
-          const response = await axios.get(url, {
-            headers: {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            },
-            timeout: 15000
-          });
-          
-          const $ = cheerio.load(response.data);
-          
-          // Multiple selector patterns
-          const selectors = [
-            '[data-event-id]',
-            '[class*="eventCard"]',
-            '.event-listing',
-            'article[class*="event"]',
-            '[data-testid="event-card"]'
-          ];
-          
-          for (const selector of selectors) {
-            $(selector).each((i, el) => {
-              try {
-                const $el = $(el);
-                
-                const name = $el.find('h3, h2, h4').first().text().trim() ||
-                            $el.find('[class*="title"]').first().text().trim() || '';
-                
-                const dateTime = $el.find('time').attr('datetime') ||
-                               $el.find('[datetime]').attr('datetime') ||
-                               $el.find('[class*="date"]').first().text().trim() || '';
-                
-                const groupName = $el.find('[data-testid="group-name"]').text().trim() ||
-                                $el.find('[class*="group"]').first().text().trim() || '';
-                
-                const link = $el.find('a').first().attr('href') ||
-                           $el.attr('href') || '';
-                
-                if (name && link && name.length > 5) {
-                  const fullUrl = link.startsWith('http') ? link : `https://www.meetup.com${link}`;
-                  
-                  // Avoid duplicates
-                  if (!events.some(e => e.url === fullUrl)) {
-                    events.push({
-                      source: 'meetup',
-                      name: name,
-                      url: fullUrl,
-                      dateTime: dateTime,
-                      organizer: groupName,
-                      location: city.charAt(0).toUpperCase() + city.slice(1),
-                      country: 'Norway',
-                      keyword: keyword
-                    });
-                  }
-                }
-              } catch (err) {
-                // Silent fail
-              }
-            });
-          }
-          
-          // Small delay to avoid rate limiting
-          await new Promise(resolve => setTimeout(resolve, 500));
-          
-        } catch (err) {
-          // Silent fail for individual keyword
-        }
-      }
-    }
-    
-    console.log(`  Found ${events.length} Meetup events`);
-  } catch (error) {
-    console.error('Meetup scraping error:', error.message);
-  }
-  
-  return events;
-}
-
-// ==================== FINN.NO EVENTS SCRAPER ====================
-async function scrapeFinnEvents() {
-  console.log('🔍 Scraping Finn.no Events...');
-  const events = [];
-  
-  try {
-    const url = 'https://www.finn.no/bap/forsale/search.html?category=0.2020&q=tech';
-    
-    const response = await axios.get(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-      },
-      timeout: 10000
-    });
-    
-    const $ = cheerio.load(response.data);
-    
-    $('article').each((i, el) => {
+    for (const url of urls) {
       try {
-        const $el = $(el);
-        const name = $el.find('h2').text().trim();
-        const link = $el.find('a').attr('href');
-        const location = $el.find('[class*="location"]').text().trim();
-        const price = $el.find('[class*="price"]').text().trim();
+        const page = await browser.newPage();
+        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
         
-        if (name && link) {
-          events.push({
-            source: 'finn.no',
-            name: name,
-            url: link.startsWith('http') ? link : `https://www.finn.no${link}`,
-            location: location,
-            priceText: price,
-            country: 'Norway'
-          });
-        }
-      } catch (err) {
-        console.error('Error parsing Finn event:', err.message);
-      }
-    });
-    
-    console.log(`  Found ${events.length} Finn.no events`);
-  } catch (error) {
-    console.error('Finn.no scraping error:', error.message);
-  }
-  
-  return events;
-}
-
-// ==================== SPECIFIC TECH COMMUNITIES SCRAPER ====================
-async function scrapeTechCommunities() {
-  console.log('🔍 Scraping Norwegian Tech Communities...');
-  const events = [];
-  
-  const communities = [
-    {
-      name: 'Oslo Tech Events',
-      url: 'https://oslotechevents.com/',
-      selectors: { title: 'h3', link: 'a', date: 'time' }
-    },
-    {
-      name: 'TechBBQ Nordic',
-      url: 'https://techbbq.org/',
-      selectors: { title: 'h2', link: 'a' }
-    }
-  ];
-  
-  for (const community of communities) {
-    try {
-      const response = await axios.get(community.url, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        },
-        timeout: 10000
-      });
-      
-      const $ = cheerio.load(response.data);
-      
-      $(community.selectors.title).each((i, el) => {
+        // Wait for event cards to appear
         try {
-          const $el = $(el).closest('article, div, section');
-          const name = $(el).text().trim();
-          const link = $el.find(community.selectors.link).attr('href');
-          const date = community.selectors.date ? $el.find(community.selectors.date).text().trim() : '';
+          await page.waitForSelector('[data-testid="categoryResults-eventCard"]', { timeout: 10000 });
+        } catch (e) {
+          // If selector not found, wait a bit anyway
+          await new Promise(resolve => setTimeout(resolve, 2000));
+        }
+        
+        // Extract events from the page using the actual HTML structure
+        const pageEvents = await page.evaluate(() => {
+          const results = [];
           
-          if (name && link && name.length > 10) {
+          // Use the actual selector from the HTML: data-testid="categoryResults-eventCard"
+          const eventCards = document.querySelectorAll('[data-testid="categoryResults-eventCard"]');
+          
+          eventCards.forEach(card => {
+            try {
+              // Find the link
+              const link = card.querySelector('a[href*="/events/"]');
+              if (!link) return;
+              
+              const href = link.getAttribute('href');
+              if (!href || !href.includes('/events/')) return;
+              
+              // Get name from h3 (actual structure)
+              let name = card.querySelector('h3')?.textContent?.trim() ||
+                        link.getAttribute('title') ||
+                        link.getAttribute('aria-label') || '';
+              
+              // Get date from time tag
+              const dateTime = card.querySelector('time[datetime]')?.getAttribute('datetime') ||
+                             card.querySelector('time')?.textContent?.trim() || '';
+              
+              // Get group name (look for "by" text)
+              const groupName = Array.from(card.querySelectorAll('div'))
+                .find(div => div.textContent?.includes('by'))?.textContent?.replace('by', '').trim() || '';
+              
+              // Extract from URL if name is still empty
+              if (!name || name.length < 5) {
+                const match = href.match(/\/([^\/]+)\/events\//);
+                if (match) {
+                  name = match[1].split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+                }
+              }
+              
+              if (name && name.length > 5) {
+                // Clean up the URL (remove query params for deduplication)
+                const cleanUrl = href.split('?')[0];
+                const fullUrl = cleanUrl.startsWith('http') ? cleanUrl : `https://www.meetup.com${cleanUrl}`;
+                
+                results.push({
+                  name: name,
+                  url: fullUrl,
+                  dateTime: dateTime,
+                  organizer: groupName
+                });
+              }
+            } catch (e) {
+              // Skip
+            }
+          });
+          
+          return results;
+        });
+        
+        // Process and add events
+        pageEvents.forEach(event => {
+          if (!isGenericStatusMessage(event.name) && !events.some(e => e.url === event.url)) {
             events.push({
-              source: community.name,
-              name: name,
-              url: link.startsWith('http') ? link : `${new URL(community.url).origin}${link}`,
-              dateText: date,
-              location: 'Oslo',
+              source: 'meetup',
+              name: event.name,
+              url: event.url,
+              dateTime: event.dateTime || '',
+              organizer: event.organizer || '',
+              location: 'Norway',
               country: 'Norway'
             });
           }
+        });
+        
+        await page.close();
+        await new Promise(resolve => setTimeout(resolve, 1000));
+          
         } catch (err) {
-          console.error(`Error parsing ${community.name} event:`, err.message);
-        }
-      });
-      
-      console.log(`  Found ${events.length} events from ${community.name}`);
-    } catch (error) {
-      console.error(`Error scraping ${community.name}:`, error.message);
+        console.warn(`  ⚠️  Meetup scrape failed for ${url}: ${err.message}`);
+      }
     }
+    
+    if (browser) await browser.close();
+    console.log(`  Found ${events.length} Meetup events`);
+  } catch (error) {
+    console.error('Meetup scraping error:', error.message);
+    if (browser) await browser.close();
   }
   
   return events;
 }
 
-// ==================== GENERIC EVENT AGGREGATOR (ENHANCED) ====================
-async function scrapeGenericEventSites() {
-  console.log('🔍 Scraping Generic Event Sites (Enhanced - More Sources)...');
+// ==================== BILLETTO.NO SCRAPER (Using Puppeteer for JS-rendered content) ====================
+async function scrapeBilletto() {
+  console.log('🔍 Scraping Billetto.no Norway Events...');
   const events = [];
+  let browser = null;
   
-  // Expanded list of event aggregator sites
-  const sites = [
-    { url: 'https://allevents.in/oslo/tech', city: 'Oslo' },
-    { url: 'https://allevents.in/bergen/tech', city: 'Bergen' },
-    { url: 'https://allevents.in/trondheim/tech', city: 'Trondheim' },
-    { url: 'https://10times.com/norway/technology', city: 'Norway' },
-    { url: 'https://www.eventful.com/oslo/events/tech', city: 'Oslo' },
-    { url: 'https://www.ticketmaster.no/discover/tech', city: 'Norway' },
-    { url: 'https://www.luvent.com/norway/technology', city: 'Norway' }
-  ];
-  
-  for (const site of sites) {
-    try {
-      const response = await axios.get(site.url, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        },
-        timeout: 15000
-      });
-      
-      const $ = cheerio.load(response.data);
-      
-      // More comprehensive selectors
-      const selectors = [
-        '.event-card', '.event-item', '[class*="event"]',
-        'article', '.card', '[data-event]', '.event-list-item',
-        '[class*="EventCard"]', '[class*="eventCard"]', '.listing-item'
-      ];
-      
-      for (const selector of selectors) {
-        $(selector).each((i, el) => {
-          try {
-            const $el = $(el);
-            const name = $el.find('h1, h2, h3, h4, .title, [class*="title"]').first().text().trim() ||
-                        $el.attr('aria-label') || '';
-            const link = $el.find('a').first().attr('href') ||
-                        $el.attr('href') || '';
-            const date = $el.find('time, .date, [class*="date"]').first().text().trim() ||
-                        $el.find('time').attr('datetime') || '';
-            const location = $el.find('.location, [class*="location"]').first().text().trim() ||
-                           site.city || 'Norway';
-            
-            if (name && link && name.length > 5) {
-              const fullUrl = link.startsWith('http') ? link : `${new URL(site.url).origin}${link}`;
+  try {
+    // Billetto uses JavaScript rendering, so we need Puppeteer
+    browser = await puppeteer.launch({ 
+      headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox']
+    });
+    
+    const urls = [
+      'https://billetto.no/',
+      'https://billetto.no/search?q=tech',
+      'https://billetto.no/search?q=technology',
+      'https://billetto.no/search?q=teknologi'
+    ];
+    
+    for (const url of urls) {
+      try {
+        const page = await browser.newPage();
+        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+        
+        // Wait for event cards to appear
+        try {
+          await page.waitForSelector('[data-testid="categoryResults-eventCard"]', { timeout: 10000 });
+        } catch (e) {
+          // If selector not found, wait a bit anyway
+          await new Promise(resolve => setTimeout(resolve, 2000));
+        }
+        
+        // Extract events from the page
+        const pageEvents = await page.evaluate(() => {
+          const results = [];
+          
+          // Try to find event links
+          const eventLinks = document.querySelectorAll('a[href*="/e/"], a[href*="/events/"]');
+          
+          eventLinks.forEach(link => {
+            try {
+              const href = link.getAttribute('href');
+              if (!href) return;
               
-              // Avoid duplicates
-              if (!events.some(e => e.url === fullUrl)) {
-                events.push({
-                  source: new URL(site.url).hostname,
+              // Get name
+              let name = link.textContent?.trim() || 
+                        link.getAttribute('aria-label') ||
+                        link.getAttribute('title') ||
+                        link.closest('div, article, li')?.querySelector('h1, h2, h3, h4')?.textContent?.trim() || '';
+              
+              // Extract from URL if needed
+              if (!name || name.length < 5) {
+                const match = href.match(/\/([^\/]+)$/);
+                if (match) {
+                  name = match[1].split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+                }
+              }
+              
+              if (name && name.length > 5) {
+                const fullUrl = href.startsWith('http') ? href : `https://billetto.no${href}`;
+                results.push({
                   name: name,
-                  url: fullUrl,
-                  dateText: date,
-                  location: location,
-                  country: 'Norway'
+                  url: fullUrl
                 });
               }
+            } catch (e) {
+              // Skip
             }
-          } catch (err) {
-            // Silent fail for generic scraping
+          });
+          
+          return results;
+        });
+        
+        // Process and add events
+        pageEvents.forEach(event => {
+          if (!isGenericStatusMessage(event.name) && !events.some(e => e.url === event.url)) {
+            events.push({
+              source: 'billetto.no',
+              name: event.name,
+              url: event.url,
+              dateText: '',
+              priceText: '',
+              image: '',
+              location: 'Norway',
+              country: 'Norway'
+            });
           }
         });
+        
+        await page.close();
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        
+      } catch (err) {
+        console.warn(`  ⚠️  Billetto scrape failed for ${url}: ${err.message}`);
       }
-      
-      // Small delay
-      await new Promise(resolve => setTimeout(resolve, 500));
-      
-    } catch (error) {
-      // Silent fail for individual sites
     }
+    
+    if (browser) await browser.close();
+    console.log(`  Found ${events.length} Billetto events`);
+  } catch (error) {
+    console.error('Billetto scraping error:', error.message);
+    if (browser) await browser.close();
   }
   
-  console.log(`  Found ${events.length} generic events`);
   return events;
 }
 
 // ==================== MAIN SCRAPER ====================
 async function scrapeAllSources() {
   console.log('🚀 Starting Multi-Source Event Scraper for Norway\n');
+  console.log('📍 Sources: Eventbrite, Meetup.com, Billetto.no\n');
   
   const allEvents = [];
   
-  // Run all scrapers
+  // Run all scrapers (only the three main sources)
   const scrapers = [
     scrapeEventbrite(),
     scrapeMeetup(),
-    scrapeFinnEvents(),
-    scrapeTechCommunities(),
-    scrapeGenericEventSites()
+    scrapeBilletto()
   ];
   
   const results = await Promise.allSettled(scrapers);
@@ -461,16 +441,17 @@ async function scrapeAllSources() {
     if (result.status === 'fulfilled') {
       allEvents.push(...result.value);
     } else {
-      console.error(`Scraper ${index + 1} failed:`, result.reason);
+      const scraperNames = ['Eventbrite', 'Meetup', 'Billetto'];
+      console.error(`❌ ${scraperNames[index]} scraper failed:`, result.reason?.message || 'Unknown error');
     }
   });
   
-  // Filter for tech-related events (more lenient - keep more events)
+  // Filter for tech-related events
   const techEvents = allEvents.filter(event => {
     const text = `${event.name} ${event.description || ''} ${event.organizer || ''}`.toLowerCase();
     // Check if event matches any keyword OR if it's from a tech source
     const matchesKeyword = TECH_KEYWORDS.some(keyword => text.includes(keyword.toLowerCase()));
-    const isTechSource = event.source === 'eventbrite' || event.source === 'meetup' || 
+    const isTechSource = event.source === 'eventbrite' || event.source === 'meetup' || event.source === 'billetto.no' ||
                         (event.category && ['technology', 'science-tech', 'startup', 'innovation'].includes(event.category));
     
     return matchesKeyword || isTechSource;

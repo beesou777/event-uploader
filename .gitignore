@@ -9,6 +9,7 @@ scraped-raw.json
 scraped-unique.json
 output.json
 uploaded-log.json
+uploader-event.json
 data.json
 
 # Logs

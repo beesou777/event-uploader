@@ -17,7 +17,7 @@ const CONFIG = {
     scraped: './scraped-raw.json',
     unique: './scraped-unique.json',
     converted: './output.json',
-    uploaded: './uploaded-log.json'
+    uploaded: './uploader-event.json'
   },
   AUTO_UPLOAD: process.env.AUTO_UPLOAD === 'true' || false,
   MAX_EVENTS_PER_RUN: 50
@@ -332,11 +332,13 @@ async function runPipeline() {
     // Don't check against existing - we're replacing the entire dataset
     console.log(`\n✅ ${uniqueEvents.length} unique events ready for conversion\n`);
     
-    // STEP 3: CONVERT TO SCHEMA
-    console.log('📍 STEP 3: CONVERTING TO EVENT SCHEMA');
+    // STEP 3: CONVERT TO SCHEMA (with AI transformation)
+    console.log('📍 STEP 3: CONVERTING TO EVENT SCHEMA (AI-Powered)');
     console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    console.log('   Scraped data saved to:', CONFIG.FILES.scraped);
+    console.log('   Now transforming with AI...\n');
     
-    const convertedEvents = convertAllEvents(uniqueEvents);
+    const convertedEvents = await convertAllEvents(uniqueEvents);
     
     // Load uploaded log to filter out already-uploaded events
     const uploadedLog = loadUploadedLog();
