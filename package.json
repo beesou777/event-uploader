@@ -1,0 +1,31 @@
+{
+  "name": "coverter",
+  "version": "1.0.0",
+  "main": "convert.js",
+  "type": "module",
+  "scripts": {
+    "scrape": "node scraper.js",
+    "convert": "node convert.js",
+    "upload": "node upload.js",
+    "full-pipeline": "node pipeline.js",
+    "manual-upload": "node manual-upload.js",
+    "cleanup": "node cleanup-output.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "Norway Tech Events Scraper & Uploader",
+  "dependencies": {
+    "atob": "^2.1.2",
+    "axios": "^1.13.2",
+    "form-data": "^4.0.5",
+    "cheerio": "^1.0.0",
+    "puppeteer": "^22.0.0",
+    "node-fetch": "^3.3.2",
+    "date-fns": "^3.0.0",
+    "string-similarity": "^4.0.4",
+    "compromise": "^14.10.0",
+    "dotenv": "^16.3.1",
+    "prompt-sync": "^4.2.0"
+  }
+}
