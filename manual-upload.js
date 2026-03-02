@@ -14,13 +14,47 @@ const prompt = promptSync({ sigint: true });
 const CONFIG = {
   API_URL: process.env.API_URL,
   ACCESS_TOKEN: process.env.ACCESS_TOKEN,
+  LOGIN_URL: process.env.LOGIN_URL || 'https://eventeir-backend.ambitiouscliff-a806dce8.eastus.azurecontainerapps.io/api/v1/auth/login',
+  LOGIN_EMAIL: process.env.LOGIN_EMAIL || 'shahbishwa21@gmail.com',
+  LOGIN_PASSWORD: process.env.LOGIN_PASSWORD || 'Test@123',
   FILES: {
     converted: './output.json',
     uploaded: './uploader-event.json'
   }
 };
 
-console.log(CONFIG);
+// ==================== LOGIN FUNCTION ====================
+async function login() {
+  try {
+    console.log('🔐 Logging in...');
+    
+    const response = await axios.post(CONFIG.LOGIN_URL, {
+      email: CONFIG.LOGIN_EMAIL,
+      password: CONFIG.LOGIN_PASSWORD
+    }, {
+      headers: {
+        'Content-Type': 'application/json'
+      }
+    });
+    
+    if (response.data && response.data.success && response.data.data && response.data.data.accessToken) {
+      CONFIG.ACCESS_TOKEN = response.data.data.accessToken;
+      console.log('✅ Login successful!');
+      console.log(`   User: ${response.data.data.user?.fullName || response.data.data.user?.email}`);
+      console.log(`   Role: ${response.data.data.user?.role || 'N/A'}\n`);
+      return true;
+    } else {
+      console.error('❌ Login failed: Invalid response structure');
+      return false;
+    }
+  } catch (error) {
+    console.error('❌ Login failed:', error.response?.data?.message || error.message);
+    if (error.response?.data) {
+      console.error('   Response:', JSON.stringify(error.response.data, null, 2));
+    }
+    return false;
+  }
+}
 
 // ==================== DISPLAY EVENT ====================
 function displayEvent(event, index, total) {
@@ -107,59 +141,54 @@ async function buildFormData(eventData) {
     }
   };
   
-  // Event details
+  // Top level fields as per CreateEventV2Dto
+  form.append("refundPolicy", String(eventData.refundPolicy || "No refund policy"));
+  form.append("ticket_currency", String(eventData.ticketCurrency || "NOK"));
+  form.append("subscriptionPlanId", String(eventData.subscriptionPlanId || 1));
+
+  // Event details as per CreateEventDto (nested inside eventDetails)
   const eventDetails = {
-    description: eventData.description,
     name: eventData.name,
-    isPhysical: eventData.isPhysical,
-    additionalInfo: eventData.additionalInfo,
-    theme: eventData.theme,
-    lang: eventData.lang,
+    description: eventData.description,
+    capacity: eventData.capacity || 100,
+    lang: eventData.lang || "en",
     startDate: eventData.startDate,
     endDate: eventData.endDate,
-    venue: eventData.venue,
-    city: eventData.city,
-    state: eventData.state,
-    country: eventData.country,
-    address1: eventData.address1,
-    address2: eventData.address2,
-    longitude: eventData.longitude,
-    latitude: eventData.latitude,
-    externalRedirectUrl: eventData.externalRedirectUrl,
-    capacity: eventData.capacity || 100,
-    platform: eventData.platform || ""
+    isPhysical: eventData.isPhysical,
+    slug: eventData.slug || "",
+    externalRedirectUrl: eventData.externalRedirectUrl || "",
+    venue: eventData.venue || "",
+    city: eventData.city || "",
+    state: eventData.state || "",
+    country: eventData.country || "",
+    address1: eventData.address1 || "",
+    address2: eventData.address2 || "",
+    startTime: eventData.startTime || "",
+    endTime: eventData.endTime || "",
+    longitude: eventData.longitude || 0,
+    latitude: eventData.latitude || 0
   };
   
   Object.entries(eventDetails).forEach(([key, value]) => {
-    safeAppend(`eventDetails[${key}]`, value);
+    form.append(`eventDetails[${key}]`, String(value));
   });
   
-  // Only add features if array has valid strings
-  if (eventData.features && Array.isArray(eventData.features) && eventData.features.length > 0) {
-    eventData.features.forEach((f, i) => {
-      if (f && typeof f === 'string' && f.trim() !== '') {
-        safeAppend(`eventDetails[features][${i}]`, f);
-      }
+  // Category IDs inside eventDetails
+  if (eventData.categoryIds && Array.isArray(eventData.categoryIds)) {
+    eventData.categoryIds.forEach((id, i) => {
+      form.append(`eventDetails[categoryIds][${i}]`, String(id));
     });
   }
   
-  eventData.categoryIds?.forEach((c, i) => {
-    safeAppend(`eventDetails[categoryIds][${i}]`, c);
-  });
+  // FAQs inside eventDetails
+  if (eventData.faqs && Array.isArray(eventData.faqs)) {
+    eventData.faqs.forEach((faq, i) => {
+      form.append(`eventDetails[faqs][${i}][question]`, String(faq.question));
+      form.append(`eventDetails[faqs][${i}][answer]`, String(faq.answer));
+    });
+  }
   
-  eventData.faqs?.forEach((faq, i) => {
-    safeAppend(`eventDetails[faqs][${i}][question]`, faq.question);
-    safeAppend(`eventDetails[faqs][${i}][answer]`, faq.answer);
-  });
-  
-  eventData.audience?.forEach((a, i) => {
-    safeAppend(`eventDetails[audience][${i}]`, a);
-  });
-  
-  safeAppend("refundPolicy", eventData.refundPolicy || "");
-  safeAppend("ticket_currency", "NOK");
-  safeAppend("subscriptionPlanId", 1);
-  
+  // Tickets at top level as per CreateEventV2Dto
   const ticketsArray = Array.isArray(eventData.tickets)
     ? eventData.tickets
     : eventData.ticket
@@ -167,10 +196,10 @@ async function buildFormData(eventData) {
     : [];
   
   ticketsArray.forEach((ticket, i) => {
-    safeAppend(`tickets[${i}][name]`, ticket.name || "General Admission");
-    safeAppend(`tickets[${i}][description]`, ticket.description || "");
-    safeAppend(`tickets[${i}][price]`, Math.floor(ticket.price || 0));
-    safeAppend(`tickets[${i}][maximumTicketCapacity]`, ticket.maximumTicketCapacity || 100);
+    form.append(`tickets[${i}][name]`, String(ticket.name || "General Admission"));
+    form.append(`tickets[${i}][description]`, String(ticket.description || ""));
+    form.append(`tickets[${i}][price]`, String(Math.floor(ticket.price || 0)));
+    form.append(`tickets[${i}][maximumTicketCapacity]`, String(ticket.maximumTicketCapacity || 100));
   });
   
   // Handle images - only add valid image URLs
@@ -274,6 +303,13 @@ function saveUploadedLog(log) {
 
 // ==================== MAIN INTERACTIVE UPLOAD ====================
 async function interactiveUpload() {
+  // Login first
+  const loginSuccess = await login();
+  if (!loginSuccess) {
+    console.log('❌ Cannot proceed without authentication.\n');
+    return;
+  }
+  
   console.log('╔════════════════════════════════════════════════════════════╗');
   console.log('║  🎯 MANUAL EVENT UPLOAD INTERFACE                        ║');
   console.log('║  Review and approve events before uploading               ║');
@@ -350,7 +386,11 @@ async function interactiveUpload() {
           await new Promise(resolve => setTimeout(resolve, 2000));
         } catch (err) {
           failed++;
-          console.error(`❌ ERROR: ${err.message}\n`);
+          console.error(`❌ ERROR for "${e.name}": ${err.message}`);
+          if (err.response?.data) {
+            console.error('Response:', JSON.stringify(err.response.data, null, 2));
+          }
+          console.log();
         }
       }
       break;

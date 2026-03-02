@@ -5,13 +5,14 @@ import { convertAllEvents } from './ai-converter.js';
 import axios from 'axios';
 import FormData from 'form-data';
 import dotenv from 'dotenv';
+import { checkIfEventExists, closePool } from './db-utils.js';
 
 // Load environment variables from .env file
 dotenv.config();
 
 // ==================== CONFIGURATION ====================
 const CONFIG = {
-  API_URL: process.env.API_URL || "https://eventeir.roshankarki1.com.np/api/v1/events/create/v2",
+  API_URL: process.env.API_URL || "https://eventeir-backend.ambitiouscliff-a806dce8.eastus.azurecontainerapps.io/api/v1/events/create/v2",
   ACCESS_TOKEN: process.env.ACCESS_TOKEN || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJlbWFpbCI6InNoYWhiaXNod2EyMUBnbWFpbC5jb20iLCJmdWxsTmFtZSI6ImJpc2h3YSBzaGFoIiwiZ2VuZGVyIjpudWxsLCJpZCI6Miwicm9sZSI6Ik9SR0FOSVpFUiIsImlhdCI6MTc2NDE2NzEyMywiZXhwIjoxNzY0MTgxNTIzfQ.GD3Jd9_uO9fszSHClw6aC7Pt-7ppE67tPnXctrjhd9o",
   FILES: {
     scraped: './scraped-raw.json',
@@ -72,7 +73,19 @@ async function buildFormData(eventData) {
     latitude: eventData.latitude,
     externalRedirectUrl: eventData.externalRedirectUrl,
     capacity: eventData.capacity || 100,
-    platform: eventData.platform || ""
+    platform: eventData.platform || "",
+    startTime: eventData.startTime,
+    endTime: eventData.endTime,
+    slug: eventData.slug,
+    fromPrice: eventData.fromPrice,
+    ticketCurrency: eventData.ticketCurrency,
+    isDraft: eventData.isDraft,
+    isFree: eventData.isFree,
+    isDeleted: eventData.isDeleted,
+    isCreatedByVerifiedUser: eventData.isCreatedByVerifiedUser,
+    recievePayment: eventData.recievePayment,
+    creatorId: eventData.creatorId,
+    subscriptionPlanId: eventData.subscriptionPlanId || 1
   };
   
   Object.entries(eventDetails).forEach(([key, value]) => {
@@ -341,97 +354,53 @@ async function runPipeline() {
     const convertedEvents = await convertAllEvents(uniqueEvents);
     
     // Load uploaded log to filter out already-uploaded events
-    const uploadedLog = loadUploadedLog();
-    console.log(`\n🔍 Checking against ${uploadedLog.length} already-uploaded events...`);
+    console.log(`\n🔍 Checking against database for existing events...`);
     
-    // Filter out events that are already uploaded (using improved URL matching)
-    const newEvents = convertedEvents.filter(event => {
-      return !isEventUploaded(event, uploadedLog);
-    });
-    
-    const alreadyUploadedCount = convertedEvents.length - newEvents.length;
-    if (alreadyUploadedCount > 0) {
-      console.log(`⏭️  Filtered out ${alreadyUploadedCount} already-uploaded events`);
-    }
-    
-    // Load existing output.json to merge with new events (avoid duplicates)
-    let existingEvents = [];
-    if (fs.existsSync(CONFIG.FILES.converted)) {
-      try {
-        const fileContent = fs.readFileSync(CONFIG.FILES.converted, 'utf-8').trim();
-        if (fileContent && fileContent !== '[]' && fileContent !== '{}') {
-          existingEvents = JSON.parse(fileContent);
-          console.log(`📂 Found ${existingEvents.length} existing events in output.json`);
-        }
-      } catch (err) {
-        console.log(`⚠️  Could not read existing output.json: ${err.message}`);
+    // Filter out events that are already in the database
+    const newEvents = [];
+    for (const event of convertedEvents) {
+      const exists = await checkIfEventExists(event.externalRedirectUrl);
+      if (!exists) {
+        newEvents.push(event);
       }
     }
     
-    // Merge existing and new events, removing duplicates
-    const allEventsMap = new Map();
-    
-    // Add existing events first
-    existingEvents.forEach(event => {
-      const key = `${event.name}|${event.externalRedirectUrl}`;
-      allEventsMap.set(key, event);
-    });
-    
-    // Add new events (will overwrite if duplicate, but that's fine)
-    newEvents.forEach(event => {
-      const key = `${event.name}|${event.externalRedirectUrl}`;
-      allEventsMap.set(key, event);
-    });
-    
-    const finalEvents = Array.from(allEventsMap.values());
-    
-    // Save merged events (only non-uploaded ones)
-    fs.writeFileSync(CONFIG.FILES.converted, JSON.stringify(finalEvents, null, 2));
-    
-    console.log(`\n✅ Total events ready to upload: ${finalEvents.length}`);
-    if (newEvents.length > 0) {
-      console.log(`   ✨ New events from this scrape: ${newEvents.length}`);
-    }
-    if (existingEvents.length > 0) {
-      console.log(`   📂 Existing events (not yet uploaded): ${existingEvents.length}`);
-    }
+    const alreadyUploadedCount = convertedEvents.length - newEvents.length;
     if (alreadyUploadedCount > 0) {
-      console.log(`   ⏭️  Already uploaded (filtered out): ${alreadyUploadedCount}`);
+      console.log(`⏭️  Filtered out ${alreadyUploadedCount} events already in database`);
     }
+    
+    // Save new events to output.json (overwrite existing as we want fresh new ones)
+    fs.writeFileSync(CONFIG.FILES.converted, JSON.stringify(newEvents, null, 2));
+    
+    console.log(`\n✅ Total events ready for manual verification: ${newEvents.length}`);
+    console.log(`   📂 Output saved to: ${CONFIG.FILES.converted}`);
     console.log();
     
-    // STEP 4: UPLOAD
-    console.log('📍 STEP 4: UPLOADING TO PLATFORM');
-    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-    
-    const { uploaded, failed } = await uploadEvents(finalEvents, CONFIG.AUTO_UPLOAD);
-    
-    // SUMMARY
+    // Summary
     console.log('\n╔════════════════════════════════════════════════════════════╗');
     console.log('║  📊 PIPELINE SUMMARY                                      ║');
     console.log('╠════════════════════════════════════════════════════════════╣');
     console.log(`║  Scraped:           ${String(scrapedEvents.length).padEnd(37)} ║`);
     console.log(`║  After dedup:       ${String(uniqueEvents.length).padEnd(37)} ║`);
     console.log(`║  Converted:         ${String(convertedEvents.length).padEnd(37)} ║`);
-    console.log(`║  Already uploaded:  ${String(alreadyUploadedCount || 0).padEnd(37)} ║`);
-    console.log(`║  Ready to upload:   ${String(finalEvents.length).padEnd(37)} ║`);
-    console.log(`║  Uploaded this run: ${String(uploaded).padEnd(37)} ║`);
-    console.log(`║  Failed:            ${String(failed).padEnd(37)} ║`);
+    console.log(`║  New (not in DB):   ${String(newEvents.length).padEnd(37)} ║`);
     console.log('╚════════════════════════════════════════════════════════════╝\n');
     
     // NEXT STEPS
-    if (!CONFIG.AUTO_UPLOAD && finalEvents.length > 0) {
-      console.log('💡 NEXT STEPS:');
-      console.log('   1. Review events in: output.json');
-      console.log('   2. Run: npm run manual-upload  (to review & upload manually)');
-      console.log('   3. Or set AUTO_UPLOAD=true to upload automatically\n');
-    }
+    console.log('💡 NEXT STEPS:');
+    console.log('   1. Review events in: output.json');
+    console.log('   2. Run: npm run manual-upload  (to review & upload manually)\n');
     
     console.log('✨ Pipeline completed successfully!\n');
+    
+    // Close DB Pool
+    await closePool();
     
   } catch (error) {
     console.error('\n❌ Pipeline Error:', error.message);
     console.error(error.stack);
+    await closePool();
     process.exit(1);
   }
 }

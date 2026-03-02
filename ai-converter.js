@@ -395,10 +395,12 @@ function matchCategories(eventText) {
     .slice(0, 3); // Max 3 categories per event
 }
 
-// ==================== FILTER EVENTS BY DATE (MIN 2-3 DAYS FROM TODAY) ====================
-export function filterEventsByDate(events, minDays = 2) {
+// ==================== FILTER EVENTS BY DATE (TODAY TO 3 MONTHS) ====================
+export function filterEventsByDate(events, minDays = 0) {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
+  
+  const threeMonthsFromNow = addDays(today, 90);
   
   return events.filter(event => {
     const startDate = parseDate(
@@ -409,16 +411,17 @@ export function filterEventsByDate(events, minDays = 2) {
       event.date
     );
     
-    const daysFromToday = differenceInDays(startDate, today);
-    return daysFromToday >= minDays;
+    if (!startDate) return false;
+    
+    // Check if it's within [today + minDays, today + 90 days]
+    return startDate >= addDays(today, minDays) && startDate <= threeMonthsFromNow;
   });
 }
 
 // ==================== PARSE DATE INTELLIGENTLY ====================
 function parseDate(dateInput, timeInput = null) {
   if (!dateInput) {
-    // Default to 7 days from now if no date provided
-    return addDays(new Date(), 7);
+    return null;
   }
   
   try {
@@ -428,7 +431,7 @@ function parseDate(dateInput, timeInput = null) {
     }
     
     if (typeof dateInput !== 'string') {
-      return addDays(new Date(), 7);
+      return null;
     }
     
     // Remove timezone abbreviations and extra text
@@ -525,8 +528,8 @@ function parseDate(dateInput, timeInput = null) {
     console.error('Date parsing error for:', dateInput, err.message);
   }
   
-  // Default to 7 days from now if all parsing fails
-  return addDays(new Date(), 7);
+  // Return null if all parsing fails
+  return null;
 }
 
 // ==================== EXTRACT PRICE INFO ====================
@@ -601,8 +604,12 @@ function isGenericStatusMessage(text) {
 
 // ==================== MAIN CONVERTER ====================
 export async function convertToEventSchema(scrapedEvent) {
+  // Normalize and clean up the name (remove multiple spaces and newlines)
+  let eventName = (scrapedEvent.name || '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  
   // Fix title if it's a generic status message
-  let eventName = scrapedEvent.name || '';
   if (isGenericStatusMessage(eventName)) {
     // Try to extract from URL
     const urlTitle = extractTitleFromUrl(scrapedEvent.url || scrapedEvent.externalRedirectUrl || '');
@@ -727,6 +734,19 @@ export async function convertToEventSchema(scrapedEvent) {
     refundPolicy: scrapedEvent.refundPolicy || 'Please visit the event page for refund policy information',
     // CRITICAL: Always ensure externalRedirectUrl is set (required field)
     externalRedirectUrl: scrapedEvent.url || scrapedEvent.externalRedirectUrl || scrapedEvent.link || '',
+    
+    // Additional fields from the user's Entity
+    startTime: format(startDate, 'HH:mm'),
+    endTime: format(endDate, 'HH:mm'),
+    totalViews: 0,
+    isDraft: false,
+    isFree: ticket.isFree || false,
+    isDeleted: false,
+    isCreatedByVerifiedUser: true,
+    recievePayment: false,
+    creatorId: 2, // Default creator ID as seen in the token/config
+    fromPrice: ticket.price || 0,
+    ticketCurrency: 'NOK'
   };
   
   // Validate that externalRedirectUrl is present
@@ -755,7 +775,7 @@ export async function convertAllEvents(scrapedEvents) {
   const errors = [];
   
   // Filter events by date (at least 2-3 days from today)
-  const minDaysFromToday = parseInt(process.env.MIN_DAYS_FROM_TODAY) || 2;
+  const minDaysFromToday = parseInt(process.env.MIN_DAYS_FROM_TODAY) || 0;
   const dateFilteredEvents = filterEventsByDate(scrapedEvents, minDaysFromToday);
   
   if (dateFilteredEvents.length < scrapedEvents.length) {
@@ -795,8 +815,11 @@ export async function convertAllEvents(scrapedEvents) {
 }
 
 // Run if called directly
-if (import.meta.url === `file://${process.argv[1]}`) {
-  const inputFile = process.argv[2] || './scraped-unique.json';
+const isDirectRun = import.meta.url.endsWith(process.argv[1].replace(/\\/g, '/')) || 
+                   import.meta.url.includes(process.argv[1].replace(/\\/g, '/'));
+
+if (isDirectRun || process.argv[1].includes('ai-converter.js')) {
+  const inputFile = process.argv[2] || './scraped-raw.json';
   const outputFile = './output.json';
   
   (async () => {
